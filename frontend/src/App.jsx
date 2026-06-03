@@ -10,8 +10,14 @@ import {
   ChevronUp, ChevronDown, Cpu, Wifi, WifiOff
 } from 'lucide-react';
 
-const API = 'http://localhost:3001/api';
-const WS_URL = 'ws://localhost:3001/ws';
+// Dev (CRA on :3000) talks to the backend on :3002. In production the backend
+// serves this build on the same origin (behind Caddy/HTTPS), so use relative
+// origin + wss:// automatically.
+const IS_DEV = window.location.port === '3000';
+const API = IS_DEV ? 'http://localhost:3002/api' : `${window.location.origin}/api`;
+const WS_URL = IS_DEV
+  ? 'ws://localhost:3002/ws'
+  : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
 // ─── Hooks ────────────────────────────────────────────────────────────────────
 
@@ -1015,8 +1021,8 @@ export default function App() {
   useEffect(() => { loadData(); }, [loadData]);
 
   const toggleBot = async () => {
-    const endpoint = botActive ? '/api/bot/stop' : '/api/bot/start';
-    await fetch(`http://localhost:3001${endpoint}`, { method: 'POST' });
+    const endpoint = botActive ? '/bot/stop' : '/bot/start';
+    await fetch(`${API}${endpoint}`, { method: 'POST' });
     setBotActive(!botActive);
   };
 

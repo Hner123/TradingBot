@@ -16,6 +16,11 @@ const wss = new WebSocket.Server({ server, path: '/ws' });
 app.use(cors());
 app.use(express.json());
 
+// Serve the built frontend (production single-server). Run `npm run build` in /frontend.
+const path = require('path');
+const FRONTEND_BUILD = path.join(__dirname, '..', 'frontend', 'build');
+app.use(express.static(FRONTEND_BUILD));
+
 // ─── WebSocket Broadcast ─────────────────────────────────────────────────────
 function broadcast(type, data) {
   const msg = JSON.stringify({ type, data, ts: Date.now() });
@@ -623,7 +628,12 @@ cron.schedule('*/10 * * * * *', async () => {
   } catch (_) {}
 });
 
-const PORT = process.env.PORT || 3001;
+// SPA fallback: any non-API GET serves the React app (must be after all API routes)
+app.get(/^(?!\/api|\/ws).*/, (req, res) => {
+  res.sendFile(path.join(FRONTEND_BUILD, 'index.html'));
+});
+
+const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`🔌 WebSocket on ws://localhost:${PORT}/ws`);
