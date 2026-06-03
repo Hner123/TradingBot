@@ -9,6 +9,20 @@ const BinanceService = require('./binance');
 const { generateSignal } = require('./signals');
 const { runBacktest } = require('./backtest-core');
 
+// Signal engines available to the live bot (selected via config.signal_engine)
+const SIGNAL_ENGINES = {
+  classic: require('./signals').generateSignal,
+  meanrev: require('./signals_meanrev').generateSignal,
+  macd_rsi_ema: require('./signals_macd_rsi_ema').generateSignal,
+};
+function getEngine(config) {
+  return SIGNAL_ENGINES[config.signal_engine] || SIGNAL_ENGINES.classic;
+}
+// How many candles each engine needs for valid signals
+function lookbackFor(config) {
+  return config.signal_engine === 'meanrev' ? 260 : 200;
+}
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
@@ -72,6 +86,9 @@ const ALLOWED_CONFIG_FIELDS = new Set([
   'api_key', 'api_secret', 'testnet', 'trading_pair', 'timeframe',
   'risk_per_trade', 'take_profit', 'stop_loss', 'leverage',
   'max_open_trades', 'is_active', 'auto_trade',
+  // live strategy config
+  'signal_engine', 'confidence_min', 'sizing_mode',
+  'mart_base', 'mart_inc', 'mart_cap', 'mart_start',
 ]);
 
 app.put('/api/config', async (req, res) => {
@@ -217,8 +234,8 @@ app.post('/api/signal/analyze', async (req, res) => {
     const { symbol, force } = req.body;
     const config = await getConfig();
     const bybit = getExchange(config);
-    const klines = await bybit.getKlines(symbol, config.timeframe, 100);
-    const result = generateSignal(klines);
+    const klines = await bybit.getKlines(symbol, config.timeframe, lookbackFor(config));
+    const result = getEngine(config)(klines);
 
     await db.query(
       `INSERT INTO signals (symbol, timeframe, \`signal\`, ema_9, ema_21, rsi, macd, macd_signal, price, confidence)
@@ -227,11 +244,11 @@ app.post('/api/signal/analyze', async (req, res) => {
         symbol,
         config.timeframe,
         result.signal,
-        result.ema9,
-        result.ema21,
-        result.rsi,
-        result.macd,
-        result.macdSignal,
+        result.ema9 || 0,
+        result.ema21 || 0,
+        result.rsi || 0,
+        result.macd || 0,
+        result.macdSignal || 0,
         result.price,
         result.confidence,
       ]
@@ -463,6 +480,23 @@ function fmt(value, step) {
   return value.toFixed(decimals);
 }
 
+// Consecutive losing trades on a symbol (drives the martingale ramp).
+// Mirrors the backtest's cap-reset: after `cap` losses the ramp resets to base.
+async function getLossStreak(symbol, cap) {
+  const [rows] = await db.query(
+    `SELECT pnl FROM trades WHERE symbol = ? AND status = 'CLOSED' AND pnl IS NOT NULL
+     ORDER BY closed_at DESC LIMIT 40`,
+    [symbol]
+  );
+  let streak = 0;
+  for (const r of rows) {
+    if (parseFloat(r.pnl) < 0) streak++;
+    else break;
+  }
+  if (cap > 0) streak = streak % cap; // reset after cap consecutive losses
+  return streak;
+}
+
 async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
   // Already in a position on this symbol? Skip.
   const existing = await bybit.getPositions(symbol);
@@ -501,11 +535,26 @@ async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
   const ticker = await bybit.getTicker(symbol);
   const price = parseFloat(ticker.lastPrice);
 
-  // Risk-based position sizing (margin scaled by leverage)
-  const riskUsdt = available * (parseFloat(config.risk_per_trade) / 100);
-  const stopDistance = price * (parseFloat(config.stop_loss) / 100);
-  const rawQty = riskUsdt / stopDistance;
-  const qty = roundDownToStep(rawQty, inst.qtyStep);
+  // ── Position sizing ──
+  let qty, marginUsed = null, lossRun = 0;
+  if (config.sizing_mode === 'martingale') {
+    // Martingale: ramp margin after `mart_start` consecutive losses on THIS symbol
+    const cap = parseInt(config.mart_cap, 10) || 0;
+    lossRun = await getLossStreak(symbol, cap);
+    const start = parseInt(config.mart_start, 10) || 1;
+    const base = parseFloat(config.mart_base) || 0;
+    const inc = parseFloat(config.mart_inc) || 0;
+    const steps = Math.max(0, lossRun - (start - 1));
+    let margin = base + inc * steps;
+    margin = Math.min(margin, available);
+    marginUsed = margin;
+    qty = roundDownToStep((margin * lev) / price, inst.qtyStep);
+  } else {
+    // Risk-based: lose `risk_per_trade`% of balance if SL hits
+    const riskUsdt = available * (parseFloat(config.risk_per_trade) / 100);
+    const stopDistance = price * (parseFloat(config.stop_loss) / 100);
+    qty = roundDownToStep(riskUsdt / stopDistance, inst.qtyStep);
+  }
 
   if (qty < inst.minOrderQty) {
     return { skipped: `qty ${qty} below minOrderQty ${inst.minOrderQty}` };
@@ -514,7 +563,9 @@ async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
   const sl = signal === 'BUY'
     ? price * (1 - config.stop_loss / 100)
     : price * (1 + config.stop_loss / 100);
-  const tp = signal === 'BUY'
+  // take_profit = 0 means no fixed target (exit handled by MACD-reversal monitor)
+  const tpEnabled = parseFloat(config.take_profit) > 0;
+  const tp = !tpEnabled ? null : signal === 'BUY'
     ? price * (1 + config.take_profit / 100)
     : price * (1 - config.take_profit / 100);
 
@@ -523,7 +574,7 @@ async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
     side: signal,
     qty: fmt(qty, inst.qtyStep),
     stopLoss: fmt(roundToStep(sl, inst.tickSize), inst.tickSize),
-    takeProfit: fmt(roundToStep(tp, inst.tickSize), inst.tickSize),
+    takeProfit: tp ? fmt(roundToStep(tp, inst.tickSize), inst.tickSize) : undefined,
   });
 
   if (order.retCode !== 0) {
@@ -546,7 +597,7 @@ async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
     symbol, side: signal, qty, price, sl, tp, orderId: order.result?.orderId,
     notional, estimatedFee,
   });
-  console.log(`[BOT] ✅ ${signal} ${symbol} qty=${qty} @ ${price} SL=${sl.toFixed(2)} TP=${tp.toFixed(2)} (est. fee $${estimatedFee.toFixed(4)})`);
+  console.log(`[BOT] ✅ ${signal} ${symbol} qty=${qty} @ ${price} SL=${sl.toFixed(2)} TP=${tp ? tp.toFixed(2) : 'MACD-exit'}${marginUsed != null ? ` margin=$${marginUsed.toFixed(2)} (lossRun ${lossRun})` : ''} (est. fee $${estimatedFee.toFixed(4)})`);
   return {
     executed: true,
     orderId: order.result?.orderId,
@@ -559,6 +610,43 @@ async function executeTrade(bybit, config, symbol, signal, broadcastFn) {
   };
 }
 
+// Close an open position when MACD reverses against it (the strategy's exit).
+// Settles the trade row with exit price + PnL so the martingale streak updates.
+async function checkMacdExits(bybit, config, macdState) {
+  const [open] = await db.query(
+    `SELECT * FROM trades WHERE status = 'OPEN' ORDER BY created_at ASC`
+  );
+  for (const t of open) {
+    const st = macdState[t.symbol];
+    if (!st) continue; // no fresh signal this cycle
+    const shouldExit = (t.side === 'BUY' && !st.macdBull) || (t.side === 'SELL' && st.macdBull);
+    if (!shouldExit) continue;
+    try {
+      // confirm live size, then close reduce-only
+      const pos = await bybit.getPositions(t.symbol);
+      const size = parseFloat(pos?.result?.list?.[0]?.size || '0');
+      if (size > 0) await bybit.closePosition(t.symbol, t.side, size);
+
+      const exitPrice = st.price;
+      const entry = parseFloat(t.entry_price);
+      const qty = parseFloat(t.quantity);
+      const dir = t.side === 'BUY' ? 1 : -1;
+      const gross = (exitPrice - entry) * dir * qty;
+      const pnl = gross - parseFloat(t.estimated_fee || 0);
+      const pnlPercent = entry > 0 ? ((exitPrice - entry) / entry) * 100 * dir : 0;
+
+      await db.query(
+        `UPDATE trades SET exit_price = ?, pnl = ?, pnl_percent = ?, status = 'CLOSED', closed_at = NOW() WHERE id = ?`,
+        [exitPrice, pnl, pnlPercent, t.id]
+      );
+      broadcast('trade_closed', { symbol: t.symbol, exitPrice, pnl, pnlPercent, reason: 'MACD_REVERSE' });
+      console.log(`[BOT] ✖ MACD-exit ${t.symbol} ${t.side} @ ${exitPrice} → PnL $${pnl.toFixed(4)} (${pnlPercent.toFixed(2)}%)`);
+    } catch (e) {
+      console.error(`[BOT] exit error ${t.symbol}:`, e.message);
+    }
+  }
+}
+
 // ─── Bot Loop (runs every 30 sec via cron) ───────────────────────────────────
 cron.schedule('*/30 * * * * *', async () => {
   try {
@@ -569,37 +657,41 @@ cron.schedule('*/30 * * * * *', async () => {
       'SELECT symbol FROM watchlist WHERE is_active = TRUE'
     );
     const bybit = getExchange(config);
+    const engine = getEngine(config);
+    const lookback = lookbackFor(config);
+    const confMin = parseInt(config.confidence_min, 10) || 60;
+    const macdState = {}; // symbol -> { macdBull, price } for the exit monitor
 
+    // 1) Compute signals for every symbol (also feeds the exit monitor)
     for (const { symbol } of watchlist) {
       try {
-        const klines = await bybit.getKlines(symbol, config.timeframe, 100);
-        const result = generateSignal(klines);
+        const klines = await bybit.getKlines(symbol, config.timeframe, lookback);
+        const result = engine(klines);
+        macdState[symbol] = { macdBull: result.macd > result.macdSignal, price: result.price };
 
         await db.query(
           `INSERT INTO signals (symbol, timeframe, \`signal\`, ema_9, ema_21, rsi, macd, macd_signal, price, confidence)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [symbol, config.timeframe, result.signal, result.ema9, result.ema21,
-           result.rsi, result.macd, result.macdSignal, result.price, result.confidence]
+          [symbol, config.timeframe, result.signal, result.ema9 || 0, result.ema21 || 0,
+           result.rsi || 0, result.macd || 0, result.macdSignal || 0, result.price, result.confidence]
         );
-
         broadcast('signal', { symbol, ...result });
 
-        if (result.signal !== 'HOLD' && result.confidence >= 60) {
+        // entry
+        if (config.auto_trade && result.signal !== 'HOLD' && result.confidence >= confMin) {
           broadcast('trade_signal', { symbol, signal: result.signal, price: result.price });
-          console.log(`[BOT] ${result.signal} signal for ${symbol} at ${result.price} (confidence ${result.confidence}%)`);
-
-          if (config.auto_trade) {
-            const outcome = await executeTrade(bybit, config, symbol, result.signal, broadcast);
-            if (outcome.skipped) {
-              console.log(`[BOT] skipped ${symbol}: ${outcome.skipped}`);
-            }
-          }
+          console.log(`[BOT] ${result.signal} ${symbol} @ ${result.price} (conf ${result.confidence}%)`);
+          const outcome = await executeTrade(bybit, config, symbol, result.signal, broadcast);
+          if (outcome.skipped) console.log(`[BOT] skipped ${symbol}: ${outcome.skipped}`);
         }
       } catch (symErr) {
         console.error(`[BOT] ${symbol} error:`, symErr.message);
         broadcast('error', { symbol, msg: symErr.message });
       }
     }
+
+    // 2) Exit any open positions whose MACD has flipped against them
+    if (config.auto_trade) await checkMacdExits(bybit, config, macdState);
   } catch (err) {
     console.error('[BOT CRON ERROR]', err.message);
     broadcast('error', { msg: err.message });

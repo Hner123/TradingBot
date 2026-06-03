@@ -125,9 +125,11 @@ function StatCard({ label, value, sub, icon: Icon, color = 'cyan', change }) {
 function SettingsModal({ onClose, onSave }) {
   const [form, setForm] = useState({
     api_key: '', api_secret: '', testnet: true, auto_trade: false,
-    trading_pair: 'BTCUSDT', timeframe: '240',
-    risk_per_trade: 1.5, take_profit: 4.0, stop_loss: 2.0,
-    leverage: 1, max_open_trades: 3,
+    trading_pair: 'BTCUSDT', timeframe: '60',
+    risk_per_trade: 1.5, take_profit: 0, stop_loss: 1.0,
+    leverage: 20, max_open_trades: 3,
+    signal_engine: 'macd_rsi_ema', confidence_min: 80, sizing_mode: 'martingale',
+    mart_base: 20, mart_inc: 10, mart_cap: 8, mart_start: 3,
   });
 
   useEffect(() => {
@@ -203,13 +205,38 @@ function SettingsModal({ onClose, onSave }) {
             ]})}
           </div>
           <div className="grid grid-cols-3 gap-4">
-            {field('Risk %', 'risk_per_trade', 'number', { min: 0.1, max: 5, step: 0.1 })}
-            {field('Take Profit %', 'take_profit', 'number', { min: 0.5, max: 20, step: 0.5 })}
+            {field('Take Profit % (0=MACD exit)', 'take_profit', 'number', { min: 0, max: 20, step: 0.5 })}
             {field('Stop Loss %', 'stop_loss', 'number', { min: 0.5, max: 10, step: 0.5 })}
+            {field('Leverage', 'leverage', 'number', { min: 1, max: 50, step: 1 })}
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            {field('Leverage', 'leverage', 'number', { min: 1, max: 10, step: 1 })}
-            {field('Max Open Trades', 'max_open_trades', 'number', { min: 1, max: 10, step: 1 })}
+
+          <div className="pt-3 mt-1 border-t border-white/10">
+            <div className="text-[11px] text-cyan-400 uppercase tracking-wide mb-3">Live Strategy</div>
+            <div className="grid grid-cols-3 gap-4">
+              {field('Signal Engine', 'signal_engine', 'select', { options: [
+                { v: 'macd_rsi_ema', l: 'MACD+RSI+EMA' },
+                { v: 'meanrev', l: 'Mean-Reversion' },
+                { v: 'classic', l: 'Classic Trend' },
+              ]})}
+              {field('Confidence ≥', 'confidence_min', 'number', { min: 50, max: 100, step: 5 })}
+              {field('Max Open Trades', 'max_open_trades', 'number', { min: 1, max: 10, step: 1 })}
+            </div>
+            <div className="grid grid-cols-2 gap-4 mt-4">
+              {field('Sizing', 'sizing_mode', 'select', { options: [
+                { v: 'martingale', l: 'Martingale' },
+                { v: 'risk', l: 'Risk %' },
+              ]})}
+              {form.sizing_mode === 'risk'
+                ? field('Risk %', 'risk_per_trade', 'number', { min: 0.1, max: 5, step: 0.1 })
+                : field('Mart. Base $', 'mart_base', 'number', { min: 1, step: 1 })}
+            </div>
+            {form.sizing_mode === 'martingale' && (
+              <div className="grid grid-cols-3 gap-4 mt-4">
+                {field('+$ per Loss', 'mart_inc', 'number', { min: 0, step: 1 })}
+                {field('Start @ Loss #', 'mart_start', 'number', { min: 1, step: 1 })}
+                {field('Streak Cap (0=off)', 'mart_cap', 'number', { min: 0, step: 1 })}
+              </div>
+            )}
           </div>
         </div>
 
